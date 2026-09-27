@@ -1,12 +1,33 @@
 import warnings
+import os
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 warnings.simplefilter("ignore")
 
+import matplotlib
+matplotlib.use('Agg')  # Must be before pyplot import
 import matplotlib.pyplot as plt
 import numpy as np
 
 np.seterr(all="ignore")
 
+# REQUIRED: TRIGGER_ID from environment (Fermi GBM format: bnYYMMDDNNN)
+TRIGGER_ID = os.environ.get("TRIGGER_ID")
+if not TRIGGER_ID:
+    raise RuntimeError("TRIGGER_ID environment variable is required (e.g., bn080916009)")
+
+# Validate Fermi GBM trigger ID format: bnYYMMDDNNN
+if not (TRIGGER_ID.startswith("bn") and len(TRIGGER_ID) == 11 and TRIGGER_ID[2:].isdigit()):
+    raise RuntimeError(f"Invalid TRIGGER_ID format: {TRIGGER_ID}. Expected Fermi GBM format: bnYYMMDDNNN (e.g., bn080916009)")
+
+# Derive catalog source name: bn080916009 -> GRB080916009
+CATALOG_NAME = "GRB" + TRIGGER_ID[2:]
+
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/output"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 from threeML import *
 from threeML.io.package_data import get_path_of_data_file
@@ -16,20 +37,20 @@ silence_warnings()
 print("=== Examining the catalog")
 
 gbm_catalog = FermiGBMBurstCatalog()
-print(gbm_catalog.query_sources("GRB080916009"))
+print(gbm_catalog.query_sources(CATALOG_NAME))
 
-grb_info = gbm_catalog.get_detector_information()["GRB080916009"]
+grb_info = gbm_catalog.get_detector_information()[CATALOG_NAME]
 
 gbm_detectors = grb_info["detectors"]
 source_interval = grb_info["source"]["fluence"]
 background_interval = grb_info["background"]["full"]
 best_fit_model = grb_info["best fit model"]["fluence"]
-model = gbm_catalog.get_model(best_fit_model, "fluence")["GRB080916009"]
+model = gbm_catalog.get_model(best_fit_model, "fluence")[CATALOG_NAME]
 
 print(model)
 
 print("=== Downloading the data")
-dload = download_GBM_trigger_data("bn080916009", detectors=gbm_detectors)
+dload = download_GBM_trigger_data(TRIGGER_ID, detectors=gbm_detectors)
 
 
 fluence_plugins = []
@@ -95,7 +116,6 @@ bayes.sample()
 
 bayes.restore_median_fit()
 fig = display_spectrum_model_counts(bayes, min_rate=20)
-
 """
 
 print("=== Time Resolved Analysis")
@@ -135,7 +155,7 @@ band = Band()
 band.alpha.prior = Truncated_gaussian(lower_bound=-1.5, upper_bound=1, mu=-1, sigma=0.5)
 band.beta.prior = Truncated_gaussian(lower_bound=-5, upper_bound=-1.6, mu=-2, sigma=0.5)
 band.xp.prior = Log_normal(mu=2, sigma=1)
-band.xp.bounds = (0, None)
+band.xp.bounds = (1e-10, None)
 band.K.prior = Log_uniform_prior(lower_bound=1e-10, upper_bound=1e3)
 ps = PointSource("grb", 0, 0, spectral_shape=band)
 band_model = Model(ps)
@@ -145,7 +165,8 @@ print("=== Perform the fits")
 models = []
 results = []
 analysis = []
-for interval in [2]: #range(12):
+intervals_analyzed = []
+for interval in [2]:  # range(12):
     print("Interval %d ..." % interval)
 
     # clone the model above so that we have a separate model
@@ -180,7 +201,7 @@ for interval in [2]: #range(12):
     bayes.set_sampler("ultranest", share_spectrum=True)
     bayes.sampler.setup(
         min_num_live_points=400, frac_remain=0.5,
-        chain_name='systematiclogs/grb-%d/ultranest/' % interval,
+        chain_name=str(OUTPUT_DIR / f'grb-{interval}-ultranest'),
     )
     res = bayes.sample()
 
@@ -192,3 +213,83 @@ for interval in [2]: #range(12):
     # onto them in memory
 
     analysis.append(bayes)
+    intervals_analyzed.append(interval)
+
+
+def _extract_parameter_summary(bayes_result):
+    """Extract parameter posterior summaries from a threeML BayesianAnalysis result."""
+    params = {}
+    try:
+        # Get all free parameter names from the model
+        for param_name in bayes_result.analysis_results.free_parameters.keys():
+            try:
+                variate = bayes_result.get_variates(param_name)
+                median_val = float(variate.median())
+                hdi_68 = variate.highest_posterior_density_interval(cl=0.68)
+                hdi_95 = variate.highest_posterior_density_interval(cl=0.95)
+                params[param_name] = {
+                    "median": median_val,
+                    "hdi_68": [float(hdi_68[0]), float(hdi_68[1])],
+                    "hdi_95": [float(hdi_95[0]), float(hdi_95[1])],
+                }
+            except Exception as e:
+                params[param_name] = {"error": str(e)}
+    except Exception as e:
+        params["_extraction_error"] = str(e)
+    return params
+
+
+def write_production_output(trigger_id, catalog_name, analysis_list, intervals, output_dir):
+    """Write analysis results to JSON files in output directory."""
+    
+    # Provenance
+    provenance = {
+        "trigger_id": trigger_id,
+        "catalog_name": catalog_name,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "intervals_analyzed": intervals,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+    }
+    
+    # Try to get threeML version
+    try:
+        import threeML
+        provenance["threeML_version"] = threeML.__version__
+    except Exception:
+        provenance["threeML_version"] = "unknown"
+    
+    # Try to get ultranest version
+    try:
+        import ultranest
+        provenance["ultranest_version"] = ultranest.__version__
+    except Exception:
+        provenance["ultranest_version"] = "unknown"
+    
+    # Write provenance.json
+    with open(output_dir / "provenance.json", "w") as f:
+        json.dump(provenance, f, indent=2)
+    
+    # Analysis results summary
+    results = {
+        "trigger_id": trigger_id,
+        "catalog_name": catalog_name,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "intervals": []
+    }
+    
+    for bayes, interval in zip(analysis_list, intervals):
+        interval_result = {
+            "interval": interval,
+            "chain_directory": str(output_dir / f'grb-{interval}-ultranest'),
+            "parameters": _extract_parameter_summary(bayes)
+        }
+        results["intervals"].append(interval_result)
+    
+    with open(output_dir / "analysis.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+
+# === Write structured output ===
+write_production_output(TRIGGER_ID, CATALOG_NAME, analysis, intervals_analyzed, OUTPUT_DIR)
+
+print("=== Analysis complete. Output written to", OUTPUT_DIR)
